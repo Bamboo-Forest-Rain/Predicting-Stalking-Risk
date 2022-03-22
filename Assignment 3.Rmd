@@ -1,0 +1,766 @@
+---
+title: "The Role of Geo-spacial Processes in Predicting Stalking Risk"
+knit: (function(input_file, encoding) {
+  out_dir <- 'docs';
+  rmarkdown::render(input_file,
+ encoding=encoding,
+ output_file=file.path(dirname(input_file), out_dir, 'index.html'))})
+author: "Yihong Hu"
+date: "10/25/2021"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+---
+
+# Introduction
+
+This report evaluates the effectiveness of geo-spacial processes in controlling selection bias (i.e. reducing errors) when predicting stalking risk in Chicago, Illinois. The raw crime data is from 2019, and raw variable data featured in to geopacial processes are from 2018. Those geo-spacial processes will be based on distance, density, and clustering of risk factors. First, the report employs feature engineering strategies to make data usable for correlation analysis. Next, Local Moran's I will be calculated to see weather stalking is committed in clusters, meaning if the crime occurrence is specially significant. In addition, race context will also be included in the evaluation. Two models will be built accordingly to predict stalking risk--one consider geo-spacial processes and one without. The errors of these models will be compared during validation. After validation, we will use 2020 stalking data as a base to compare the risk induced by the model and kernel density. By this comparison, we can see if our geo-spacial model is really reliably.
+
+Overall, based on this report, geo-spacial processes are not significant factors in predicting stalking risk. However, one thing to pay attention is the lack of enough data to build a reliable model: The rate of reporting is low for this type of crime. 
+
+```{r setup, include=FALSE}
+#Load libraries and functions
+knitr::opts_chunk$set(echo = TRUE, results ='hide', warning=FALSE, message = FALSE, cache = FALSE)
+
+library(tidyverse)
+library(sf)
+library(RSocrata)
+library(viridis)
+library(spatstat)
+library(raster)
+library(spdep)
+library(FNN)
+library(grid)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(tidycensus)
+# functions
+root.dir = "https://github.com/Bamboo-Forest-Rain/Public-Policy-Analytics-Landing/tree/master/DATA"
+source("https://raw.githubusercontent.com/Bamboo-Forest-Rain/Public-Policy-Analytics-Landing/master/functions.r")
+
+census_api_key("94efffd19b56ad527e379faea1653ee74dc3de4a",overwrite = TRUE)
+
+```
+
+
+```{r Chicago Data}
+#Load Chicago maps 
+
+policeDistricts <- 
+  st_read("https://data.cityofchicago.org/api/geospatial/fthy-xz3r?method=export&format=GeoJSON") %>%
+  st_transform('ESRI:102271') %>%
+  dplyr::select(District = dist_num)
+  
+policeBeats <- 
+  st_read("https://data.cityofchicago.org/api/geospatial/aerh-rz74?method=export&format=GeoJSON") %>%
+  st_transform('ESRI:102271') %>%
+  dplyr::select(District = beat_num)
+
+bothPoliceUnits <- rbind(mutate(policeDistricts, Legend = "Police Districts"), 
+                         mutate(policeBeats, Legend = "Police Beats"))
+
+#Load crime data
+Crime2019 <- 
+  read.csv("Crime2019.csv") 
+
+Stalking <-
+  Crime2019 %>% 
+    filter(Primary.Type == "STALKING") %>%
+    filter(!Description == "CYBERSTALKING")%>%
+    mutate(x = gsub("[()]", "", Location)) %>%
+    separate(x,into= c("Y","X"), sep=",") %>%
+    mutate(X = as.numeric(X),Y = as.numeric(Y)) %>% 
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant")%>%
+    st_transform('ESRI:102271') %>% 
+    distinct()
+
+chicagoBoundary <- 
+  st_read(file.path("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/Chapter5/chicagoBoundary.geojson")) %>%
+  st_transform('ESRI:102271') 
+
+chicagoNeihbor <-
+   st_read(file.path("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/Chapter5/chicagoNhoods.geojson")) %>%
+  st_transform('ESRI:102271') 
+  
+```
+
+# Feature Engineering
+
+Stalking (excluding cyberstalking) is a pretty tricky crime to be reported due to many selection bias. First, stalking could be under-reported. People might choose to not report the act when they are hesitant about if the potential "stalkers" are coincidentally heading towards the same direction as them. 
+
+Second, the time of the day is a bias. More people might report the crime at night time, while during the day the act of "stalking" is not very apparent.
+
+Third, the place may be a factor as well. An act might be perceived as stalking more likely in a less dense, low lighting, littered, and "blight" area than in a very dense and bright area, such as the city center or in a mall. 
+
+
+Fig 1. shows the place of occurrence and density of stalkings in Chicago. From a glance, we see that stalking happened most frequently around the Loop and the South Chicago.  
+```{r Crime Points}
+# Stalking count and density in Chicago
+grid.arrange(ncol=2,bottom = "Fig 1. Stalking count and density in Chicago 2019",
+             
+ggplot() + 
+  geom_sf(data = chicagoBoundary,fill = "grey40") +
+  geom_sf(data = policeDistricts, fill = "white", color = "black")+
+  geom_sf(data = Stalking, colour="red", size=0.3, show.legend = "point") +
+  labs(title= "Stalking (excluding cyberstalking)",
+       subtitle = "Based on Police Districts, Chicago, IL") +
+  mapTheme(title_size = 14),
+
+ggplot() + 
+  geom_sf(data = chicagoBoundary, fill = "grey40") +
+  stat_density2d(stat = "sf_coordinates",
+                 data = data.frame(st_coordinates(Stalking)), 
+                 aes(X, Y, fill = ..level.., alpha = ..level..),
+                 size = 0.01, bins = 40, geom = 'polygon') +
+  scale_fill_viridis() +
+  scale_alpha(range = c(0.00, 0.35), guide = FALSE) +
+  labs(title = "Stalking Density (excluding cyberstalking)",
+       subtitle = "Chicago, IL") +
+  mapTheme(title_size = 14) + theme(legend.position = "none"))
+
+```
+
+## Fishnet
+
+A fishnet makes Chicago into multiple 500ft X 500ft grids evenly to minimize spacial bias.
+
+Fig 2. Maps the stalking count observed in each fishnet. No obvious pattern is observed, but stalking seems to occurr slightly more in the North than that of the South. 
+
+```{r fishnet}
+fishnet <- 
+  st_make_grid(chicagoBoundary,
+               cellsize = 500, 
+               square = TRUE) %>%
+  .[chicagoBoundary] %>%            
+  st_sf() %>%
+  mutate(uniqueID = rownames(.))
+
+crime_net <- 
+  dplyr::select(Stalking) %>% 
+  mutate(countStalking = 1) %>% 
+  aggregate(., fishnet, sum) %>%
+  mutate(countStalking = replace_na(countStalking, 0),
+         uniqueID = rownames(.),
+         cvID = sample(round(nrow(fishnet) / 24), 
+                       size=nrow(fishnet), replace = TRUE))
+
+ggplot() +
+  geom_sf(data = crime_net, aes(fill = countStalking), color = NA) +
+  scale_fill_viridis() +
+  labs(title = "Count of Stalking for the Fishnet", Legend = "Stalking Count", caption="Fig.2") +
+  mapTheme()
+```
+
+## Modeling Spatial Features
+
+Several variables are chosen as risk factors to be incorporated in the analysis. Population density is reflected through the access to transportation and the distance to the Loop, assuming the better the access, the higher the density; darkness is reflected through the reported outage of street lighting; blightness is reflected through the presence of abandoned cars, buildings, and garbage carts maintenance requests.
+
+```{r Loading Risk Factors}
+#Download data
+bicycle_statoin <- 
+  read.socrata("https://data.cityofchicago.org/Transportation/Divvy-Bicycle-Stations-In-Service/67g3-8ig8") %>%
+  na.omit() %>%
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326, agr = "constant") %>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Bicycle_Station")%>%
+  dplyr::select(geometry,Legend)
+
+bus_station <-
+  st_read("CTA_BusStops.kml")%>%
+  st_zm(drop = TRUE, what = "ZM")%>%
+  st_transform(st_crs(fishnet)) %>%
+  mutate(Legend = "Bus_Station")%>%
+  dplyr::select(geometry,Legend)
+
+#I have previous downloaded the data, and saved them as local ".csv" files.
+
+#abandoned_bu <- read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Vacant-and-Abandoned-Building/7nii-7srd")
+          
+#streetLightsOut <-read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Street-Lights-All-Out/zuxi-7xem") 
+          
+#garbage_cart <- read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Garbage-Carts-Historical/9ksk-na4q")
+          
+#abandonCars <- read.socrata("https://data.cityofchicago.org/Service-Requests/311-Service-Requests-Abandoned-Vehicles/3c9v-pnva")
+
+abandoned_bu <- 
+read.csv("abandoned_bu.csv") %>%
+mutate(year = substr(date_service_request_was_received,1,4))%>% filter(year == "2018") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+   st_transform(st_crs(fishnet)) %>%
+   mutate(Legend = "Abandoned_Building")
+
+streetLightsOut <-
+read.csv("streetLightsOut.csv") %>%
+  mutate(year = substr(creation_date,1,4))%>% filter(year == "2018") %>%
+  dplyr::select(Y = latitude, X = longitude) %>%
+ na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+   mutate(Legend = "Street_Lights_Out")
+
+
+garbage_cart <- 
+read.csv("garbage_cart.csv") %>%
+mutate(year = substr(creation_date,1,4)) %>% filter(year == "2018")%>%
+dplyr::select(Y = latitude, X = longitude) %>% na.omit() %>%
+st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+st_transform(st_crs(fishnet)) %>%
+mutate(Legend = "Garbage_Cart")
+
+abandonCars <-
+  read.csv("abandonCars.csv")%>%
+  mutate(year = substr(creation_date,1,4)) %>% filter(year == "2018") %>%
+    dplyr::select(Y = latitude, X = longitude) %>%
+    na.omit() %>%
+    st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+    st_transform(st_crs(fishnet)) %>%
+    mutate(Legend = "Abandoned_Cars")
+
+```
+
+Fig 3. below shows the count of each risk factor in each fishnet grid. We can see that the Loop and the northside has better transportation access, along with more abandoned cars. 
+
+```{r Maps of Risk Factors}
+#Join variables with fishnet
+vars_net <- 
+  rbind(abandoned_bu,bicycle_statoin, garbage_cart,streetLightsOut,bus_station,abandonCars)%>%
+  st_join(., fishnet, join=st_within) %>%
+  st_drop_geometry() %>%
+  group_by(uniqueID, Legend) %>%
+  summarize(count = n()) %>%
+    full_join(fishnet) %>%
+    spread(Legend, count, fill=0) %>%
+    st_sf() %>%
+    dplyr::select(-`<NA>`) %>%
+    na.omit() %>%
+    ungroup()
+
+vars_net.long <- 
+  gather(vars_net, Variable, value, -geometry, -uniqueID)
+
+vars <- unique(vars_net.long$Variable)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(vars_net.long, Variable == i), aes(fill=value), colour=NA) +
+      scale_fill_viridis(name="") +
+      labs(title=i) +
+      mapTheme()}
+
+do.call(grid.arrange,c(mapList, ncol=3, top="Fig 3. Count of Risk Factors by Fishnet Cell"))
+```
+
+## Risk factor and nearest neighbor
+
+To evaluate the clustering of these risk factors more accurately, nearest neighbor function is used. The function tells us how far away the incidents of each factor happen. The lower the distance (the darker the color on the map) means the incidents occur fairly close in the region, and vise versa. 
+
+Note that centriods are used for measuring the distance between grids, because unlike polygons, they are much neater and easier to easier to use. 
+
+We can see that bicycle stations become less as we move towards the suburb in the north and west. The yellow patch (where incidents occur far away from each other) at the bottom right corner is green space for a marshland, a gulf course and two parks, thus the fewer reportings and counts of variables.
+
+```{r Risk Factor on Nearest Neighbor}
+
+st_c <- st_coordinates
+st_coid <- st_centroid
+
+v_cen <- st_c(st_coid(vars_net))
+st_c_ab <- st_c(abandoned_bu)
+st_c_bs <- st_c(bus_station)
+st_c_gc <- st_c(garbage_cart)
+
+vars_net <-
+  vars_net %>%
+    mutate(Abandoned_Building.nn = nn_function(v_cen, st_c_ab,3),
+      Abandoned_Cars.nn = nn_function(st_c(st_coid(vars_net)),
+                                      st_c(abandonCars),3),
+      Street_Lights_Out.nn = nn_function(st_c(st_coid(vars_net)),
+                                         st_c(streetLightsOut),3),
+      Bicycle_Station.nn = nn_function(st_c(st_coid(vars_net)),
+                                       st_c(bicycle_statoin),3),
+      Bus_Station.nn = nn_function(st_c(st_coid(vars_net)),
+                                         st_c_bs,3),
+      Garbage_Carts.nn = nn_function(st_c(st_coid(vars_net)),
+                                         st_c_gc,3))
+
+vars_net.long.nn <- 
+  dplyr::select(vars_net, ends_with(".nn")) %>%
+    gather(Variable, value, -geometry)
+
+vars <- unique(vars_net.long.nn$Variable)
+mapList <- list()
+
+for(i in vars){
+  mapList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(vars_net.long.nn, Variable == i), aes(fill=value), colour=NA) +
+      scale_fill_viridis(name="") +
+      labs(title=i) +
+      mapTheme()}
+
+do.call(grid.arrange,c(mapList, ncol = 3, top = "Fig. 4 Nearest Neighbor Risk Factors by Fishnet"))
+```
+
+## Distance to the Loop
+
+Fig 5. maps the distance to the loop over the fishnet. This is useful for thinking about density for population, events, amenities. The assumption is that the further away from the city center, the less busy and less dense the regions would be.
+
+```{r Distance from Loop}
+loopPoint <-
+  filter(chicagoNeihbor, name == "Loop") %>%
+  st_centroid()
+
+vars_net$loopDistance =
+  st_distance(st_centroid(vars_net),loopPoint) %>%
+  as.numeric() 
+
+ggplot() +
+      geom_sf(data = vars_net, aes(fill=loopDistance), colour="grey30") +
+      scale_fill_viridis(name="Distance (ft)") +
+      labs(title = "Euclidian Distance to the Loop", caption = "Fig. 5",
+          )+
+      mapTheme()
+  
+```
+
+# Local Moran's I 
+
+Local Moran's I indicates weather a variable occurs in cluster in a given location over a bigger region. In this case, this method is to access if the stalking count in a grid is randomly distributed relative to its immediate grids. In other words, is the crime largely committed in one neighborhood compare to another? 
+
+We will first join the risk factors with stalking data in 2019 to create a "final net". Then a spatial weights matrix is created to relate a unit to its neighbors. Lastly the final net is joined with the matrix to calculate for the Local Moran's Is.
+
+Fig 6. shows the result. The higher the Is, indicated by the second map, the stronger the local clustering appears to be. P-value provides another similar perspective. We can say an area with a P-value less than 0.05 has significant local clustering rather than randomly distributed. Those areas marked in yellow are stalking "hotspot".
+
+Those areas are spread out over the city. They are not concentrated over a particular region in Chicago. 
+
+```{r Final Net}
+#Combine all variables/risk factors with crime data to create final net
+final_net <-
+  left_join(crime_net, st_drop_geometry(vars_net), by="uniqueID") 
+
+final_net <-
+  st_centroid(final_net) %>%
+    st_join(dplyr::select(chicagoNeihbor, name)) %>%
+    st_join(dplyr::select(policeDistricts, District)) %>%
+      st_drop_geometry() %>%
+      left_join(dplyr::select(final_net, geometry, uniqueID)) %>%
+      st_sf()
+
+```
+
+```{r Local Moran}
+#Create spatial weights matrix
+final_net.nb <- poly2nb(as_Spatial(final_net), queen=TRUE)
+final_net.weights <- nb2listw(final_net.nb, style="W", zero.policy=TRUE)
+
+#Join final net with the matrix and run Local Moran's Is. 
+final_net.localMorans <- 
+  cbind(
+    as.data.frame(localmoran(final_net$countStalking, final_net.weights)),
+    as.data.frame(final_net)) %>% 
+    st_sf() 
+
+#Identify hotspot
+final_net.localMorans <-
+  final_net.localMorans %>%
+      dplyr::select(Stalking_Count = countStalking, 
+                    Local_Morans_I = Ii, 
+                    P_Value = `Pr(z != E(Ii))`) %>%
+      mutate(Significant_Hotspots = ifelse(P_Value <= 0.05, 1, 0)) %>%
+      gather(Variable, Value, -geometry)
+  
+
+vars <- unique(final_net.localMorans$Variable)
+varList <- list()
+
+#Small Multiple Maps of statistics of Local Moran's I
+
+for(i in vars){
+  varList[[i]] <- 
+    ggplot() +
+      geom_sf(data = filter(final_net.localMorans, Variable == i), 
+              aes(fill = Value), colour=NA) +
+      scale_fill_viridis(name="") +
+      labs(title=i) +
+      mapTheme() + theme(legend.position="bottom")}
+
+do.call(grid.arrange,c(varList, ncol = 4, top = "Fig.6 Local Morans I statistics, Stalking"))
+```
+
+## Distance to Stalking Hotsopts
+
+High clustered areas with higher significance are selected (p-value < 0.00001). Distance data is generated that measures the distance of places to its nearest stalking hotspot. Fig. 7 is the distance map. This data can be included in the spacial analysis as well. 
+
+```{r Distiance to HotSpot}
+
+#Mark out hotsopts that has strong clustering
+
+final_net <- final_net %>% 
+  mutate(stalking.isSig = 
+           ifelse(localmoran(final_net$countStalking, 
+                             final_net.weights)[,5] <= 0.00001, 1, 0)) %>%
+  mutate(stalking.isSig.dist = 
+           nn_function(st_coordinates(st_centroid(final_net)),
+                       st_coordinates(st_centroid(
+                         filter(final_net, stalking.isSig == 1))), 1))
+
+ggplot()+
+  geom_sf(data=final_net, aes(fill=stalking.isSig.dist),color = "grey30")+
+  scale_fill_viridis(name = "Distance to Hotstop (ft)")+
+  labs(title = "Distance to Highly Significant Stalking Hotspots", caption = "Fig 7")+
+  mapTheme()
+```
+
+#Correlation Tests and Plots
+
+Fig.8 explores the correlation between risk factors and stalking count by Pearson's R. The count and the nearest neighbor result are shown side by side. To avoid colinearity only one side should be selected to use in the multivariate regression model. 
+
+When r = 0, this means the x and y variable has no association. The r of the chosen side should be further away from 0, suggesting a stronger correlation. 
+
+```{r Correlation, fig.height = 15, fig.width=8}
+
+correlation.long <-
+  st_drop_geometry(final_net) %>%
+    dplyr::select(-uniqueID, -cvID, -loopDistance, -name, -District) %>%
+    gather(Variable, Value, -countStalking)
+
+correlation.cor <-
+  correlation.long %>%
+    group_by(Variable) %>%
+    summarize(correlation = cor(Value, countStalking, use = "complete.obs"))
+    
+ggplot(correlation.long, aes(Value, countStalking)) +
+  geom_point(size = 0.1) +
+  geom_text(data = correlation.cor, aes(label = paste("r =", round(correlation, 2))),
+            x=-Inf, y=Inf, vjust = 1.5, hjust = -.1) +
+  geom_smooth(method = "lm", se = FALSE, colour = "black") +
+  facet_wrap(~Variable, ncol = 2, scales = "free") +
+  labs(title = "Stalking Count as a Function of Risk Factors", caption = "Fig 8") +
+  plotTheme()
+```
+
+# Poisson Regression and Validation
+
+Fig 9. Shows the distribution of the 2019 stalking count in Chicago. Stalking data has relatively a small sample size, therefore the maximum frequency of stalking in a grid cell is 2. Nevertheless, we can see that the data is not normally distributed
+
+OLS regression assumes that the dependent variable is continuous and normally distributed. This is not the case in crime, because not every grid cell would have crime count. Therefore Poisson regression is a better option here to model count data with skewed distribution. 
+
+```{r Histogram, fig.width=4,fig.height=4}
+ggplot()+
+  geom_histogram(data = final_net,aes(countStalking), binwidth = 0.8
+                 )+
+  labs(title = "Distribution of Stalking Count",x = "Number of Stalkings Reported", y = "Frequency", caption="Fig 9.") +
+  plotTheme()
+ 
+```
+
+## Cross-Validation 
+
+Two sets of variables are considered for validation. The first set has just risk factors, while the second one also considers geo-spacial process (represented by local Moran's I).
+
+K-fold and LOGO (Leave-one-group-out) cross-validation (CV) methods are used here. LOGO-CV is used to evaluate if one neighborhood/police district/police beat would have the same crime pattern as others. 
+
+
+```{r Crossvaliadation}
+
+#create sets of variables: one just has risk factors, the other also includes geo-spacial data 
+
+reg.vars <- c("Abandoned_Building.nn", "Abandoned_Cars.nn", "Bicycle_Station", "Bus_Station", "Street_Lights_Out", "Garbage_Carts.nn", "loopDistance")
+
+reg.ss.vars <- c("Abandoned_Building.nn", "Abandoned_Cars.nn", "Bicycle_Station", "Bus_Station", "Street_Lights_Out", "Garbage_Carts.nn", "loopDistance","stalking.isSig","stalking.isSig.dist")
+
+#Cross-validation based on fishnet grid cells for k-fold regression
+reg.cv <- crossValidate(
+  dataset = final_net,
+  id = "cvID",
+  dependentVariable = "countStalking",
+  indVariables = reg.vars) %>%
+    dplyr::select(cvID = cvID, countStalking, Prediction, geometry)
+
+reg.ss.cv <- crossValidate(
+  dataset = final_net,
+  id = "cvID",
+  dependentVariable = "countStalking",
+  indVariables = reg.ss.vars) %>%
+    dplyr::select(cvID = cvID, countStalking, Prediction, geometry)
+
+#LOGO-CV based on Chicago neighborhoods.
+
+reg.spatialCV <- crossValidate(
+  dataset = na.omit(final_net),
+  id = "name",
+  dependentVariable = "countStalking",
+  indVariables = reg.vars) %>%
+    dplyr::select(cvID = name, countStalking, Prediction, geometry)
+
+reg.ss.spatialCV <- crossValidate(
+  dataset = na.omit(final_net),
+  id = "name",
+  dependentVariable = "countStalking",
+  indVariables = reg.ss.vars) %>%
+    dplyr::select(cvID = name, countStalking, Prediction, geometry)
+```
+
+## Errors
+
+The errors are the difference between the predicted counts (as the result of cross-validation) and the observed counts. We will mutate errors on both sets of variables. The comparison of errors between these two sets of variable help us to see if geo-spacial processes are useful in predicting potential crime. 
+
+According to Fig.10, Fig. 11, and Table 1, the mean absolute errors (MAE) have no very little, almost no difference between between geo-spacial process included and non-included base variables. This result means geo-spacial processes do not play a significant role in predicting stalking occurrences. 
+
+```{r Summarize regression, results=TRUE}
+#Regression Summary
+reg.summary <- 
+  rbind(mutate(reg.cv,           
+               Error = Prediction - countStalking,
+               Regression = "Random k-fold CV: Just Risk Factors"),
+                             
+       mutate(reg.ss.cv,       
+              Error = Prediction - countStalking,
+              Regression = "Random k-fold CV: Spatial Process"),
+    
+       mutate(reg.spatialCV,    
+              Error = Prediction - countStalking,
+              Regression = "Spatial LOGO-CV: Just Risk Factors"),
+                             
+      mutate(reg.ss.spatialCV, 
+             Error = Prediction - countStalking,
+             Regression = "Spatial LOGO-CV: Spatial Process")) %>%
+    st_sf() 
+
+#k-flods vs. LOGO-CV
+error_by_reg_and_fold <- 
+  reg.summary %>%
+    group_by(Regression, cvID) %>% 
+    summarize(Mean_Error = mean(Prediction - countStalking, na.rm = T),
+              MAE = mean(abs(Mean_Error), na.rm = T),
+              SD_MAE = mean(abs(Mean_Error), na.rm = T)) %>%
+  ungroup()
+
+error_by_reg_and_fold %>%
+  ggplot(aes(MAE)) + 
+    geom_histogram(bins = 30, colour="black", fill = "#FDE725FF") +
+    facet_wrap(~Regression) +  
+    geom_vline(xintercept = 0) + scale_x_continuous(breaks = seq(0, 8, by = 1)) + 
+    labs(title="Fig. 10 Distribution of MAE", subtitle = "k-fold cross validation vs. LOGO-CV",
+         x="Mean Absolute Error", y="Count") +
+    plotTheme()
+
+#Table of MAE and standard deviation MAE by regression
+st_drop_geometry(error_by_reg_and_fold) %>%
+  group_by(Regression) %>% 
+    summarize(Mean_MAE = round(mean(MAE), 2),
+              SD_MAE = round(sd(MAE), 2)) %>%
+  kable(caption="Table 1. Mean MAE and Standard Deviation of MAE of Two Models") %>%
+    kable_styling("striped", full_width = F) %>%
+    row_spec(2, color = "black", background = "#FDE725FF") %>%
+    row_spec(4, color = "black", background = "#FDE725FF") 
+
+```
+
+```{r map of k-flod and LOGO-CV, fig.width = 20, fig.height=20}
+#Map of model errors by random k-fold and spatial cross validation.
+error_by_reg_and_fold %>%
+  ggplot() +
+    geom_sf(aes(fill = MAE)) +
+    facet_wrap(~Regression) +
+    scale_fill_viridis() +
+    labs(title = "  Fig. 11 Stalking errors by K-folds and LOGO Cross-validation") +
+    mapTheme() + theme(legend.position="bottom",
+                       legend.title = element_text(size=30),
+                       legend.key.size = unit(1, 'cm'),
+                       legend.text = element_text(size=10),
+                       plot.title = element_text(size=30))
+
+error.fold.time <- 
+  reg.summary.time %>%
+    group_by(week) %>% 
+    summarize(Mean_Error = mean(Prediction - countEMS, na.rm = T),
+              MAE = mean(abs(Mean_Error), na.rm = T),
+              SD_MAE = mean(abs(Mean_Error), na.rm = T)) %>%
+  ungroup()
+```
+
+## Evaluation based on Race Context 
+
+Chicago is a highly segregated city, therefore we want to access if the model could generalize well when race context is considered. Fig.12 shows that the majority of the population in the north and loop area of Chicago are white (defined by areas that have more than 50% of white population).
+
+Table 2 summarizes mean MAE based on this race context (i.e. majority white). We see that both models could generalize well with respect to race, there is no major difference in MAE between majority white and non-white neighborhoods. In other words, race does not help much in accounting for the selection bias. 
+
+It is also interesting to see that the mean MAE based on neighborhoods are larger than when considering geo-spacial processes. This means the model that includes geo-spacial processes perform worse on stalking prediction based on neighborhoods. 
+
+```{r Race Context, echo=FALSE, cache=FALSE,message=FALSE}
+
+#Download race data from U.S census bureau
+tracts19 <- 
+  get_acs(geography = "tract", variables = c("B01001_001E","B01001A_001E"), 
+          year = 2019, state=17, county=031, geometry=T) %>%
+  st_transform('ESRI:102271')  %>% 
+  dplyr::select(variable, estimate, GEOID) %>%
+  spread(variable, estimate) %>%
+  rename(TotalPop = B01001_001,
+         NumberWhites = B01001A_001) %>%
+  mutate(percentWhite = NumberWhites / TotalPop,
+         raceContext = ifelse(percentWhite > .5, "Majority White", "Majority Non White")) %>%
+  .[chicagoNeihbor,]%>%
+  na.omit()
+```
+
+```{r, results='asis'}
+#Map shows race context
+ggplot()+
+  geom_sf(data = tracts19 ,aes(fill=raceContext))+
+  labs(title = "Race Context in Chicago", cpation = "Fig. 12")+
+  mapTheme()
+
+#Table shows MAR by neighborhood racial context
+reg.summary %>% 
+  filter(str_detect(Regression, "LOGO")) %>%
+    st_centroid() %>%
+    st_join(tracts19) %>%
+    na.omit() %>%
+      st_drop_geometry() %>%
+      group_by(Regression, raceContext) %>%
+      summarize(mean.Error = mean(Error, na.rm = T)) %>%
+      spread(raceContext, mean.Error) %>%
+      kable(caption = "Table 2. Mean Error by neighborhood racial context") %>%
+        kable_styling("striped", full_width = F)  
+```
+
+# Comparison with Kernel Density
+
+This section compares the traditional method of using "kernel density" with the geo-spacial model we generated. "Kernel density" only considers spacial auto correction. We will compute the kernel density on 2019 stalking data, divide data into 5 risk categories, and join the risk categories with 2020 stalking data points.
+
+The regression model generated in this report will predict stalking count for 2019. The prediction will also be divided into 5 risk categories and joined with 2020 stalking data points
+
+We will compare the rate of points by risk category and model type. We will see which method captures a greater share of 2020 stalking in the highest risk category (i.e. which one has more points lay in the yellow area of Fig. 14). Gerneally, a model is said to be good when it captures higher share than that of kernel density.
+
+Fig.13 maps the kernel density based on stalking count. 
+
+```{r kernal density}
+#Setting up for kernel density method
+stalking_ppp <- as.ppp(st_coordinates(Stalking), W = st_bbox(final_net))
+stalking_KD <- density.ppp(stalking_ppp, 1000)
+
+#Map of stalking count with kernel density
+as.data.frame(stalking_KD) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(final_net)) %>%
+  aggregate(., final_net, mean) %>%
+   ggplot() +
+     geom_sf(aes(fill=value)) +
+     geom_sf(data = sample_n(Stalking, 205), size = .5) +
+     scale_fill_viridis(name = "Density") +
+     labs(title = "Kernel Density of 2019 Stalking", caption = "Fig 13") +
+     mapTheme()
+```
+
+## Risk Catagories and 2020 Stalking Points
+
+It is hard to tell right away from Fig.14 which yellow patch of the map captures the highest number of 2020 stalking points. 
+
+```{r Generate 2020 Prediction}
+
+#Loading 2020 stalking data
+stalking2020 <-
+read.csv("crime2020.csv")%>%
+  filter(Primary.Type == "STALKING" & 
+         !(Description == "CYBERSTALKING")) %>%
+  mutate(x = gsub("[()]", "", Location)) %>%
+  separate(x,into= c("Y","X"), sep=",") %>%
+  mutate(X = as.numeric(X),
+         Y = as.numeric(Y)) %>% 
+  na.omit %>%
+  st_as_sf(coords = c("X", "Y"), crs = 4326, agr = "constant") %>%
+  st_transform('ESRI:102271') %>% 
+  distinct() %>%
+  .[fishnet,]
+
+#Kernel Density Risk Categories of Stalking in 2020
+stalking_ppp <- as.ppp(st_coordinates(Stalking), W = st_bbox(final_net))
+salking_KD <- density.ppp(stalking_ppp, 1000)
+
+stalking_KDE_sf <- as.data.frame(stalking_KD) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(final_net)) %>%
+  aggregate(., final_net, mean) %>%
+  mutate(label = "Kernel Density",
+         Risk_Category = ntile(value, 100),
+         Risk_Category = case_when(
+           Risk_Category >= 90 ~ "90% to 100%",
+           Risk_Category >= 70 & Risk_Category <= 89 ~ "70% to 89%",
+           Risk_Category >= 50 & Risk_Category <= 69 ~ "50% to 69%",
+           Risk_Category >= 30 & Risk_Category <= 49 ~ "30% to 49%",
+           Risk_Category >= 1 & Risk_Category <= 29 ~ "1% to 29%")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(stalking2020) %>% mutate(stalkingCount = 1), ., sum) %>%
+    mutate(stalkingCount = replace_na(stalkingCount, 0))) %>%
+  dplyr::select(label, Risk_Category, stalkingCount)
+
+#Geo-spacial regression model Risk Categorizes of stalking in 2020
+stalking_risk_sf <-
+  filter(reg.summary, Regression == "Spatial LOGO-CV: Spatial Process") %>%
+  mutate(label = "Risk Predictions",
+         Risk_Category = ntile(Prediction, 100),
+         Risk_Category = case_when(
+           Risk_Category >= 90 ~ "90% to 100%",
+           Risk_Category >= 70 & Risk_Category <= 89 ~ "70% to 89%",
+           Risk_Category >= 50 & Risk_Category <= 69 ~ "50% to 69%",
+           Risk_Category >= 30 & Risk_Category <= 49 ~ "30% to 49%",
+           Risk_Category >= 1 & Risk_Category <= 29 ~ "1% to 29%")) %>%
+  cbind(
+    aggregate(
+      dplyr::select(stalking2020) %>% mutate(stalkingCount = 1), ., sum) %>%
+      mutate(stalkingCount = replace_na(stalkingCount, 0))) %>%
+  dplyr::select(label,Risk_Category, stalkingCount)
+
+#Map compares two models in terms of risk categories and stalking points in 2020.
+rbind(stalking_KDE_sf, stalking_risk_sf) %>%
+  na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category, -geometry) %>%
+  ggplot() +
+    geom_sf(aes(fill = Risk_Category), colour = NA) +
+    geom_sf(data = sample_n(stalking2020, 163), size = .5, colour = "black") +
+    facet_wrap(~label, ) +
+    scale_fill_viridis(discrete = TRUE) +
+    labs(title="Comparison of Kernel Density and Risk Predictions",
+         subtitle="2019 stalking risk predictions; 2020 burglaries", caption ="Fig. 14") +
+    mapTheme()
+
+```
+
+## Bar Graph Comparison between Kernel Density and Geo-Spacial Model
+
+We will make the maps of comparison above into a bar graph. Fig. 15 shows the 
+share of 2020 stalking points in different risk category. The share of geo-spacial regression model is fairly comparable to the share by kernel density. For the highest risk catagories though (70% to 89% and 90% to 100%), it failed to deliver a better result than the kernel density method.
+
+```{r comparison in table form}
+
+#Bar graph compares the share of 2020 stalking in each risk category generated by kernel density and regression model 
+
+rbind(stalking_KDE_sf, stalking_risk_sf) %>%
+  st_set_geometry(NULL) %>% na.omit() %>%
+  gather(Variable, Value, -label, -Risk_Category) %>%
+  group_by(label, Risk_Category) %>%
+  summarize(countStalking = sum(Value)) %>%
+  ungroup() %>%
+  group_by(label) %>%
+  mutate(Rate_of_test_set_crimes = countStalking / sum(countStalking)) %>%
+    ggplot(aes(Risk_Category,Rate_of_test_set_crimes)) +
+      geom_bar(aes(fill=label), position="dodge", stat="identity") +
+      scale_fill_viridis(discrete = TRUE) +
+      labs(title = "Fig 15. Risk prediction vs. Kernel density, 2020 stalking") +
+      plotTheme() + theme(axis.text.x = element_text(angle = 45, vjust = 0.5))
+```
+
+# Conclusion
+This report evaluates the role of geo-spacial processes to control selection bias when predicting for stalking risk in Chicago, therefore to make the regression model more reliable. In conclusion, the report shows that geo-spacial processes are insignificant in predicting stalking risk and will not recommend this algorithm be put into production for predicting stalking risk. Firstly, the model does not reduce mean absolute errors when incorporating geo-spacial processes (represented by Local Moran's I) to predict stalking risks, comparing to the model that just considers risk factors. Second, it fails to outperform kernel density method that captures a higher share of stalking incidents at higher risk categories in 2020. In addition, the model generalizes well when race context is considered. One would think race may contribute to selection bias in crime, this report shows that it is not the reason or sole reason for stalking to be reported. 
+
+This conclusion might be unreliable, however, due to several reasons. First, there might be a sampling bias: the sample size for stalking in 2019 is very small, considering stalking is a rarely reported crime type. Only 205 cases are assessed in this case and these are not sufficient for model training to produce an accurate prediction. Second, the pandemic in 2020 might also create bias in stalking data during while most of the people are working from home. This bias might have affected the performance of our model when compared to kernel density at the end. One way to improve the model, is to aggregate the stalking information in an time interval, say five years, to expand on sample size, and use that data set to identify stalking hotspot. 
