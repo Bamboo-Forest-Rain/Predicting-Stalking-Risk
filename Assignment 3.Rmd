@@ -580,13 +580,13 @@ error_by_reg_and_fold %>%
                        legend.text = element_text(size=10),
                        plot.title = element_text(size=30))
 
-error.fold.time <- 
-  reg.summary.time %>%
-    group_by(week) %>% 
-    summarize(Mean_Error = mean(Prediction - countEMS, na.rm = T),
-              MAE = mean(abs(Mean_Error), na.rm = T),
-              SD_MAE = mean(abs(Mean_Error), na.rm = T)) %>%
-  ungroup()
+#error.fold.time <- 
+ # reg.summary.time %>%
+  #  group_by(week) %>% 
+   # summarize(Mean_Error = mean(Prediction - countEMS, na.rm = T),
+    #          MAE = mean(abs(Mean_Error), na.rm = T),
+     #         SD_MAE = mean(abs(Mean_Error), na.rm = T)) %>%
+#  ungroup()
 ```
 
 ## Evaluation based on Race Context 
